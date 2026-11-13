@@ -1,220 +1,560 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+import asyncio
+import logging
+import os
+import secrets
+import sqlite3
+import time
 
-# C extensions
-*.so
+import aiohttp
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+logging.basicConfig(level=logging.INFO)
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# ---------- Config (.env file or environment variables) ----------
+def load_env(path=".env"):
+    data = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    data[k.strip()] = v.strip().strip('"').strip("'")
+    return data
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-*.lcov
-.hypothesis/
-.pytest_cache/
-cover/
 
-# Translations
-*.mo
-*.pot
+ENV = load_env()
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or ENV.get("BOT_TOKEN", "")
+ADMIN_RAW = os.environ.get("ADMIN_IDS") or ENV.get("ADMIN_IDS", "")
+ADMINS = {int(x) for x in ADMIN_RAW.replace(" ", "").split(",") if x.isdigit()}
+BOT_USERNAME = ""
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# ---------- Database ----------
+db = sqlite3.connect("bot.db", check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.executescript("""
+CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY, name TEXT, joined INTEGER,
+    banned INTEGER DEFAULT 0, verified_until INTEGER DEFAULT 0,
+    referred_by INTEGER, ref_count INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS premium(user_id INTEGER PRIMARY KEY, expiry INTEGER);
+CREATE TABLE IF NOT EXISTS links(
+    code TEXT PRIMARY KEY, special INTEGER DEFAULT 0,
+    created INTEGER, created_by INTEGER);
+CREATE TABLE IF NOT EXISTS link_files(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT,
+    file_id TEXT, ftype TEXT, caption TEXT);
+CREATE TABLE IF NOT EXISTS tokens(
+    token TEXT PRIMARY KEY, user_id INTEGER, code TEXT,
+    created INTEGER, used INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+""")
+db.commit()
 
-# Flask stuff:
-instance/
-.webassets-cache
+DEFAULTS = {
+    "shortener_domain": "",
+    "shortener_api": "",
+    "validity_hours": "2",
+    "referral_hours": "1",
+    "min_seconds": "0",
+    "premium_link": "",
+    "protect": "0",
+    "auto_delete_min": "0",
+}
+NUMERIC = {"validity_hours", "referral_hours", "min_seconds", "protect", "auto_delete_min"}
+PLANS = {"7d": 7, "1m": 30, "1y": 365}
+SENDERS = {
+    "document": "send_document", "video": "send_video", "photo": "send_photo",
+    "audio": "send_audio", "voice": "send_voice", "animation": "send_animation",
+}
 
-# Scrapy stuff:
-.scrapy
+router = Router()
+sessions = {}   # admin_id -> {"mode", "special", "files"}
+tasks = set()
 
-# Sphinx documentation
-docs/_build/
 
-# PyBuilder
-.pybuilder/
-target/
+def get(key):
+    r = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else DEFAULTS[key]
 
-# Jupyter Notebook
-.ipynb_checkpoints
 
-# IPython
-profile_default/
-ipython_config.py
+def put(key, val):
+    db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, val))
+    db.commit()
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+def now():
+    return int(time.time())
 
-# uv
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+def fmt(ts):
+    return time.strftime("%d-%m-%Y %H:%M", time.localtime(ts))
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi/*
-!.pixi/config.toml
+def is_premium(uid):
+    r = db.execute("SELECT expiry FROM premium WHERE user_id=?", (uid,)).fetchone()
+    return bool(r and r["expiry"] > now())
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
 
-# Celery stuff
-celerybeat-schedule*
-celerybeat.pid
+def shortener_ready():
+    return bool(get("shortener_domain") and get("shortener_api"))
 
-# Redis
-*.rdb
-*.aof
-*.pid
 
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
+class IsAdmin(BaseFilter):
+    async def __call__(self, m: Message) -> bool:
+        return m.from_user is not None and m.from_user.id in ADMINS
 
-# ActiveMQ
-activemq-data/
 
-# SageMath parsed files
-*.sage.py
+# ---------- Helpers ----------
+def add_user(m, ref=None):
+    uid = m.from_user.id
+    if db.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
+        return False
+    db.execute(
+        "INSERT INTO users(user_id,name,joined,referred_by) VALUES(?,?,?,?)",
+        (uid, m.from_user.full_name, now(), ref))
+    db.commit()
+    return True
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
 
-# Spyder project settings
-.spyderproject
-.spyproject
+async def reward_referrer(bot, ref):
+    r = db.execute("SELECT verified_until FROM users WHERE user_id=?", (ref,)).fetchone()
+    hrs = int(get("referral_hours"))
+    if not r or hrs <= 0:
+        return
+    base = max(now(), r["verified_until"])
+    db.execute(
+        "UPDATE users SET verified_until=?, ref_count=ref_count+1 WHERE user_id=?",
+        (base + hrs * 3600, ref))
+    db.commit()
+    try:
+        await bot.send_message(ref, f"🎉 Someone joined with your link! You got {hrs} hour(s) of free access.")
+    except Exception:
+        pass
 
-# Rope project settings
-.ropeproject
 
-# mkdocs/Zensical documentation
-/site
+def extract(m):
+    if m.animation:
+        return "animation", m.animation.file_id
+    if m.document:
+        return "document", m.document.file_id
+    if m.video:
+        return "video", m.video.file_id
+    if m.photo:
+        return "photo", m.photo[-1].file_id
+    if m.audio:
+        return "audio", m.audio.file_id
+    if m.voice:
+        return "voice", m.voice.file_id
+    return None
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
 
-# Pyre type checker
-.pyre/
+async def delete_later(bot, chat_id, ids, minutes):
+    await asyncio.sleep(minutes * 60)
+    for i in ids:
+        try:
+            await bot.delete_message(chat_id, i)
+        except Exception:
+            pass
 
-# pytype static type analyzer
-.pytype/
 
-# Cython debug symbols
-cython_debug/
+async def send_files(bot, chat_id, code):
+    rows = db.execute("SELECT * FROM link_files WHERE code=? ORDER BY id", (code,)).fetchall()
+    protect = get("protect") == "1"
+    ids = []
+    for r in rows:
+        try:
+            sender = getattr(bot, SENDERS[r["ftype"]])
+            msg = await sender(chat_id, r["file_id"], caption=r["caption"] or None, protect_content=protect)
+            ids.append(msg.message_id)
+        except Exception as e:
+            logging.error("send failed: %s", e)
+        await asyncio.sleep(0.3)
+    minutes = int(get("auto_delete_min"))
+    if ids and minutes > 0:
+        note = await bot.send_message(chat_id, f"⏳ Files will be deleted in {minutes} minute(s). Save them now.")
+        ids.append(note.message_id)
+        t = asyncio.create_task(delete_later(bot, chat_id, ids, minutes))
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
 
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
 
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
+async def shorten(url):
+    domain, api = get("shortener_domain"), get("shortener_api")
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(f"https://{domain}/api", params={"api": api, "url": url}) as r:
+                data = await r.json(content_type=None)
+        return data.get("shortenedUrl") or data.get("shortened_url") or data.get("short_url")
+    except Exception as e:
+        logging.error("shortener error: %s", e)
+        return None
 
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore that
-#   can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, you
-#   could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
 
-# Ruff stuff:
-.ruff_cache/
+async def deliver(m, code):
+    uid = m.from_user.id
+    link = db.execute("SELECT * FROM links WHERE code=?", (code,)).fetchone()
+    if not link:
+        return await m.answer("❌ This link is invalid or has been removed.")
+    u = db.execute("SELECT verified_until FROM users WHERE user_id=?", (uid,)).fetchone()
+    free = (link["special"] == 1 or uid in ADMINS or is_premium(uid)
+            or (u and u["verified_until"] > now()) or not shortener_ready())
+    if free:
+        return await send_files(m.bot, uid, code)
 
-# PyPI configuration file
-.pypirc
+    token = secrets.token_urlsafe(9)
+    db.execute("INSERT INTO tokens(token,user_id,code,created) VALUES(?,?,?,?)",
+               (token, uid, code, now()))
+    db.commit()
+    target = f"https://t.me/{BOT_USERNAME}?start=verify_{token}"
+    short = await shorten(target)
+    if not short:
+        return await m.answer("⚠️ Could not create the verification link. Please try again later.")
+    rows = [[InlineKeyboardButton(text="✅ Verify & Get File", url=short)]]
+    if get("premium_link"):
+        rows.append([InlineKeyboardButton(text="💎 Get Premium (No Ads)", url=get("premium_link"))])
+    hrs = get("validity_hours")
+    await m.answer(
+        f"🔐 Complete the link below to unlock your file.\n"
+        f"After verifying, you get {hrs} hour(s) of free access.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
 
-# Streamlit
-.streamlit/secrets.toml
+async def verify(m, token):
+    uid = m.from_user.id
+    t = db.execute("SELECT * FROM tokens WHERE token=?", (token,)).fetchone()
+    if not t or t["user_id"] != uid:
+        return await m.answer("❌ Invalid verification link.")
+    if t["used"] or now() - t["created"] > 86400:
+        return await m.answer("❌ This link is already used or expired. Open the file link again.")
+    if now() - t["created"] < int(get("min_seconds")):
+        return await m.answer("⚠️ Please complete the verification link properly.")
+    until = now() + int(get("validity_hours")) * 3600
+    db.execute("UPDATE tokens SET used=1 WHERE token=?", (token,))
+    db.execute("UPDATE users SET verified_until=? WHERE user_id=?", (until, uid))
+    db.commit()
+    await m.answer(f"✅ Verified! Free access till {fmt(until)}.")
+    await send_files(m.bot, uid, t["code"])
+
+
+def finalize(uid):
+    s = sessions.pop(uid)
+    code = secrets.token_urlsafe(6)
+    db.execute("INSERT INTO links VALUES(?,?,?,?)", (code, s["special"], now(), uid))
+    for ftype, fid, cap in s["files"]:
+        db.execute("INSERT INTO link_files(code,file_id,ftype,caption) VALUES(?,?,?,?)",
+                   (code, fid, ftype, cap))
+    db.commit()
+    return f"https://t.me/{BOT_USERNAME}?start=file_{code}"
+
+
+# ---------- User commands ----------
+@router.message(CommandStart())
+async def start(m: Message, command: CommandObject):
+    uid = m.from_user.id
+    payload = command.args or ""
+    ref = int(payload[4:]) if payload.startswith("ref_") and payload[4:].isdigit() else None
+    if ref == uid:
+        ref = None
+    is_new = add_user(m, ref)
+    row = db.execute("SELECT banned FROM users WHERE user_id=?", (uid,)).fetchone()
+    if row["banned"]:
+        return await m.answer("🚫 You are banned from using this bot.")
+    if is_new and ref:
+        await reward_referrer(m.bot, ref)
+    if payload.startswith("file_"):
+        return await deliver(m, payload[5:])
+    if payload.startswith("verify_"):
+        return await verify(m, payload[7:])
+    await m.answer("👋 Welcome! Open a file link from our channel to get your file.\n\n"
+                   "/refer - invite friends\n/mypremium - premium status")
+
+
+@router.message(Command("mypremium"))
+async def mypremium(m: Message):
+    r = db.execute("SELECT expiry FROM premium WHERE user_id=?", (m.from_user.id,)).fetchone()
+    if r and r["expiry"] > now():
+        await m.answer(f"💎 Premium active till {fmt(r['expiry'])}")
+    else:
+        await m.answer("You do not have an active premium plan.")
+
+
+@router.message(Command("refer"))
+async def refer(m: Message):
+    r = db.execute("SELECT ref_count FROM users WHERE user_id=?", (m.from_user.id,)).fetchone()
+    count = r["ref_count"] if r else 0
+    await m.answer(f"🎁 Your referral link:\nhttps://t.me/{BOT_USERNAME}?start=ref_{m.from_user.id}\n\n"
+                   f"Each new user gives you {get('referral_hours')} hour(s) of free access.\n"
+                   f"Total referrals: {count}")
+
+
+@router.message(Command("help"))
+async def help_cmd(m: Message):
+    text = "/start /mypremium /refer /help"
+    if m.from_user.id in ADMINS:
+        text += ("\n\nADMIN:\n/genlink - single file link\n/batch - multi file link\n"
+                 "/universal_link - multi file link\n/special_link - free link (no shortener)\n"
+                 "/done - finish batch\n/cancel - cancel\n/files - list links\n/delfile <code>\n"
+                 "/shortener <domain> <api_key> | off\n/settings\n/set <key> <value>\n"
+                 "/addpremium <id> <7d|1m|1y|days>\n/removepremium <id>\n/whitelisters\n"
+                 "/ban <id>\n/unban <id>\n/userinfo <id>\n/stats\n/broadcast <text> (or reply)")
+    await m.answer(text)
+
+
+# ---------- Admin: link creation ----------
+async def begin(m, mode, special):
+    sessions[m.from_user.id] = {"mode": mode, "special": special, "files": []}
+    if mode == "single":
+        await m.answer("📤 Send the file now.")
+    else:
+        await m.answer("📤 Send all files one by one. Send /done when finished, /cancel to stop.")
+
+
+@router.message(Command("genlink"), IsAdmin())
+async def genlink(m: Message):
+    await begin(m, "single", 0)
+
+
+@router.message(Command("batch"), IsAdmin())
+async def batch(m: Message):
+    await begin(m, "batch", 0)
+
+
+@router.message(Command("universal_link"), IsAdmin())
+async def universal(m: Message):
+    await begin(m, "batch", 0)
+
+
+@router.message(Command("special_link"), IsAdmin())
+async def special(m: Message):
+    await begin(m, "batch", 1)
+
+
+@router.message(Command("cancel"), IsAdmin())
+async def cancel(m: Message):
+    sessions.pop(m.from_user.id, None)
+    await m.answer("Cancelled.")
+
+
+@router.message(Command("done"), IsAdmin())
+async def done(m: Message):
+    s = sessions.get(m.from_user.id)
+    if not s or not s["files"]:
+        return await m.answer("No files added yet.")
+    await m.answer(f"✅ Link created ({len(s['files'])} file(s)):\n{finalize(m.from_user.id)}")
+
+
+@router.message(F.document | F.video | F.photo | F.audio | F.voice | F.animation)
+async def on_media(m: Message):
+    uid = m.from_user.id
+    s = sessions.get(uid)
+    if uid not in ADMINS or not s:
+        return
+    got = extract(m)
+    if not got:
+        return
+    s["files"].append((got[0], got[1], m.caption or ""))
+    if s["mode"] == "single":
+        await m.answer(f"✅ Link created:\n{finalize(uid)}")
+    else:
+        await m.answer(f"➕ Added ({len(s['files'])}). Send more or /done.")
+
+
+@router.message(Command("files"), IsAdmin())
+async def files_cmd(m: Message):
+    rows = db.execute(
+        "SELECT l.code, l.special, l.created, (SELECT COUNT(*) FROM link_files f WHERE f.code=l.code) n "
+        "FROM links l ORDER BY l.created DESC LIMIT 20").fetchall()
+    if not rows:
+        return await m.answer("No links yet.")
+    lines = [f"{r['code']} | {r['n']} file(s) | {'FREE' if r['special'] else 'normal'} | {fmt(r['created'])}"
+             for r in rows]
+    await m.answer("Last 20 links:\n" + "\n".join(lines))
+
+
+@router.message(Command("delfile"), IsAdmin())
+async def delfile(m: Message, command: CommandObject):
+    code = (command.args or "").strip()
+    if not code:
+        return await m.answer("Usage: /delfile <code>")
+    db.execute("DELETE FROM link_files WHERE code=?", (code,))
+    db.execute("DELETE FROM links WHERE code=?", (code,))
+    db.commit()
+    await m.answer("🗑 Deleted (if it existed).")
+
+
+# ---------- Admin: shortener & settings ----------
+@router.message(Command("shortener"), IsAdmin())
+async def shortener_cmd(m: Message, command: CommandObject):
+    a = (command.args or "").split()
+    if a == ["off"]:
+        put("shortener_domain", "")
+        put("shortener_api", "")
+        return await m.answer("Shortener turned OFF. Files will be sent directly.")
+    if len(a) != 2:
+        return await m.answer("Usage: /shortener <domain> <api_key>\nExample: /shortener example.com abc123\nOr: /shortener off")
+    domain = a[0].replace("https://", "").replace("http://", "").strip("/")
+    put("shortener_domain", domain)
+    put("shortener_api", a[1])
+    await m.answer(f"✅ Shortener set: {domain}")
+
+
+@router.message(Command("settings"), IsAdmin())
+async def settings_cmd(m: Message):
+    api = get("shortener_api")
+    await m.answer(
+        "⚙️ Settings\n"
+        f"shortener_domain: {get('shortener_domain') or '-'}\n"
+        f"shortener_api: {api[:4] + '...' if api else '-'}\n"
+        f"validity_hours: {get('validity_hours')}\n"
+        f"referral_hours: {get('referral_hours')}\n"
+        f"min_seconds: {get('min_seconds')}\n"
+        f"premium_link: {get('premium_link') or '-'}\n"
+        f"protect (1=no forward/save): {get('protect')}\n"
+        f"auto_delete_min (0=off): {get('auto_delete_min')}\n\n"
+        "Change: /set <key> <value>\nExample: /set validity_hours 1")
+
+
+@router.message(Command("set"), IsAdmin())
+async def set_cmd(m: Message, command: CommandObject):
+    a = (command.args or "").split(maxsplit=1)
+    if len(a) != 2 or a[0] not in DEFAULTS or a[0] in ("shortener_domain", "shortener_api"):
+        return await m.answer("Usage: /set <key> <value>\nKeys: validity_hours, referral_hours, "
+                              "min_seconds, premium_link, protect, auto_delete_min")
+    if a[0] in NUMERIC and not a[1].isdigit():
+        return await m.answer("Value must be a number.")
+    put(a[0], a[1])
+    await m.answer(f"✅ {a[0]} = {a[1]}")
+
+
+# ---------- Admin: users & premium ----------
+@router.message(Command("addpremium"), IsAdmin())
+async def addpremium(m: Message, command: CommandObject):
+    a = (command.args or "").split()
+    usage = "Usage: /addpremium <user_id> <7d|1m|1y|days>"
+    if len(a) != 2 or not a[0].isdigit():
+        return await m.answer(usage)
+    plan = a[1].lower()
+    days = PLANS.get(plan) or (int(plan) if plan.isdigit() else 0)
+    if days <= 0:
+        return await m.answer(usage)
+    uid = int(a[0])
+    r = db.execute("SELECT expiry FROM premium WHERE user_id=?", (uid,)).fetchone()
+    base = max(now(), r["expiry"]) if r else now()
+    exp = base + days * 86400
+    db.execute("INSERT OR REPLACE INTO premium VALUES(?,?)", (uid, exp))
+    db.commit()
+    await m.answer(f"✅ Premium for {uid} till {fmt(exp)}")
+    try:
+        await m.bot.send_message(uid, f"💎 Premium activated! Valid till {fmt(exp)}.")
+    except Exception:
+        pass
+
+
+@router.message(Command("removepremium"), IsAdmin())
+async def removepremium(m: Message, command: CommandObject):
+    a = (command.args or "").strip()
+    if not a.isdigit():
+        return await m.answer("Usage: /removepremium <user_id>")
+    db.execute("DELETE FROM premium WHERE user_id=?", (int(a),))
+    db.commit()
+    await m.answer("✅ Premium removed.")
+
+
+@router.message(Command("whitelisters"), IsAdmin())
+async def whitelisters(m: Message):
+    rows = db.execute("SELECT * FROM premium WHERE expiry>? ORDER BY expiry", (now(),)).fetchall()
+    if not rows:
+        return await m.answer("No active premium users.")
+    await m.answer("💎 Active premium users:\n" +
+                   "\n".join(f"{r['user_id']} - till {fmt(r['expiry'])}" for r in rows))
+
+
+@router.message(Command("ban"), IsAdmin())
+async def ban(m: Message, command: CommandObject):
+    a = (command.args or "").strip()
+    if not a.isdigit():
+        return await m.answer("Usage: /ban <user_id>")
+    db.execute("UPDATE users SET banned=1 WHERE user_id=?", (int(a),))
+    db.commit()
+    await m.answer("🚫 Banned.")
+
+
+@router.message(Command("unban"), IsAdmin())
+async def unban(m: Message, command: CommandObject):
+    a = (command.args or "").strip()
+    if not a.isdigit():
+        return await m.answer("Usage: /unban <user_id>")
+    db.execute("UPDATE users SET banned=0 WHERE user_id=?", (int(a),))
+    db.commit()
+    await m.answer("✅ Unbanned.")
+
+
+@router.message(Command("userinfo"), IsAdmin())
+async def userinfo(m: Message, command: CommandObject):
+    a = (command.args or "").strip()
+    if not a.isdigit():
+        return await m.answer("Usage: /userinfo <user_id>")
+    u = db.execute("SELECT * FROM users WHERE user_id=?", (int(a),)).fetchone()
+    if not u:
+        return await m.answer("User not found.")
+    p = db.execute("SELECT expiry FROM premium WHERE user_id=?", (int(a),)).fetchone()
+    await m.answer(
+        f"Name: {u['name']}\nID: {u['user_id']}\nJoined: {fmt(u['joined'])}\n"
+        f"Banned: {'yes' if u['banned'] else 'no'}\n"
+        f"Free access till: {fmt(u['verified_until']) if u['verified_until'] > now() else '-'}\n"
+        f"Premium till: {fmt(p['expiry']) if p and p['expiry'] > now() else '-'}\n"
+        f"Referrals: {u['ref_count']}")
+
+
+@router.message(Command("stats"), IsAdmin())
+async def stats(m: Message):
+    c = lambda q, *p: db.execute(q, p).fetchone()[0]
+    await m.answer(
+        f"👥 Users: {c('SELECT COUNT(*) FROM users')}\n"
+        f"🚫 Banned: {c('SELECT COUNT(*) FROM users WHERE banned=1')}\n"
+        f"💎 Premium: {c('SELECT COUNT(*) FROM premium WHERE expiry>?', now())}\n"
+        f"🔗 Links: {c('SELECT COUNT(*) FROM links')}\n"
+        f"📁 Files: {c('SELECT COUNT(*) FROM link_files')}")
+
+
+@router.message(Command("broadcast"), IsAdmin())
+async def broadcast(m: Message, command: CommandObject):
+    if not m.reply_to_message and not command.args:
+        return await m.answer("Usage: /broadcast <text>  (or reply to a message with /broadcast)")
+    ids = [r["user_id"] for r in db.execute("SELECT user_id FROM users WHERE banned=0")]
+    await m.answer(f"Sending to {len(ids)} users...")
+    ok = fail = 0
+    for uid in ids:
+        try:
+            if m.reply_to_message:
+                await m.reply_to_message.copy_to(uid)
+            else:
+                await m.bot.send_message(uid, command.args)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await m.answer(f"📢 Done. Sent: {ok}, Failed: {fail}")
+
+
+# ---------- Run ----------
+async def main():
+    global BOT_USERNAME
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is missing. Create the .env file first.")
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    BOT_USERNAME = (await bot.get_me()).username
+    logging.info("Bot started as @%s", BOT_USERNAME)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
